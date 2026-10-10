@@ -1,4 +1,4 @@
--- ChessHint Termux 1.0.1
+-- ChessHint Termux 1.0.2
 local Http = game:GetService("HttpService")
 local Logs = game:GetService("LogService")
 local Players = game:GetService("Players")
@@ -359,7 +359,9 @@ task.spawn(function()
         if job.version~=revision then continue end
         last=os.clock()
         log("Consultando FEN: "..job.fen)
+        local sentAt=os.clock()
         local status,data,body=callApi(job.fen)
+        local elapsed=os.clock()-sentAt
         if not running or job.version~=revision then continue end
         if not running or job.version~=revision then continue end
         if not status or status==429 or status>=500 then
@@ -374,6 +376,18 @@ task.spawn(function()
         if status~=200 or type(data)~="table" or data.error or data.type=="error" then
             log("API rejeitou a consulta: "..tostring(body)); continue
         end
+        local engineTime=tonumber(data.time)
+        local nodes=tonumber(data.nodes)
+        local nps=tonumber(data.nps)
+            or (nodes and engineTime and engineTime>0 and nodes/engineTime)
+        log(string.format(
+            "Desempenho: motor %s | busca %s s | total %.2f s | profundidade %s | nós %s | nós/s %s",
+            tostring(data.engine or "Stockfish"),
+            engineTime and string.format("%.3f",engineTime) or "?",
+            elapsed,tostring(data.depth or "?"),
+            nodes and string.format("%.0f",nodes) or "?",
+            nps and string.format("%.0f",nps) or "?"
+        ))
         if data.game_over then log("Posição encerrada: "..tostring(data.result)); clear(); continue end
         local move=data.move or data.lan
         if type(move)~="string" or not move:match("^[a-h][1-8][a-h][1-8][qrbn]?$") then
@@ -553,7 +567,7 @@ watch(Input.InputEnded,function(input)
 end)
 watch(root:GetPropertyChangedSignal("AbsoluteSize"),layout)
 layout()
-log("ChessHint Termux 1.0.1 ativo; "..#samples.." peças lidas")
+log("ChessHint Termux 1.0.2 ativo; "..#samples.." peças lidas")
 log("Arraste pelo título; role o painel para acessar todos os campos")
 log("Amarelo = peça; verde = destino. Escolha lado e vez no painel")
 log("Parar: getgenv().ChessHintStop(); dica: getgenv().ChessHintNow()")
