@@ -1,4 +1,4 @@
--- ChessHint 1.2.0
+-- ChessHint 1.3.0
 local Http = game:GetService("HttpService")
 local Logs = game:GetService("LogService")
 local Players = game:GetService("Players")
@@ -231,6 +231,7 @@ local function apply(move)
     if newInstance then p.kind=move.promotion; p.instance=newInstance end
     halfmove=(pawn or victim) and 0 or halfmove+1
     if p.color=="b" then fullmove+=1 end
+    p.inTransit=nil
     turn=p.color=="w" and "b" or "w"
     revision+=1; pending=nil; clear()
     log("Confirmado: "..move.from.." → "..move.to..(move.promotion and " promoção "..move.promotion or ""))
@@ -252,6 +253,54 @@ task.spawn(function()
         task.wait(0.05)
         if not running then break end
         if not turn then continue end
+        -- Partidas humanas podem não produzir nenhum registro de jogada.
+        -- Detecta deslocamento real antes de consultar os candidatos do console.
+        local used={}
+        for _,p in pairs(state) do used[p.instance]=true end
+        for from,p in pairs(state) do
+            if p.color~=turn then continue end
+            local obj=p.instance
+            local position=obj and obj.Parent==Pieces and pos(obj)
+            local to=squareAt(position)
+            local promotion
+            if p.kind=="p" then
+                local lastRank=p.color=="w" and "8" or "1"
+                if to and to:sub(2)==lastRank then
+                    local changed=kind(obj)
+                    if changed and changed~="p" then promotion=changed end
+                end
+                -- A promoção também pode destruir o peão e criar outro modelo.
+                if not position or (to and to:sub(2)==lastRank) then
+                    for _,replacement in ipairs(Pieces:GetChildren()) do
+                        local k=kind(replacement)
+                        local target=squareAt(pos(replacement))
+                        if (not used[replacement] or replacement==obj)
+                            and (k=="q" or k=="r" or k=="b" or k=="n")
+                            and colorOf(replacement)==p.color and target
+                            and target:sub(2)==lastRank
+                            and math.abs(target:byte(1)-from:byte(1))<=1
+                            and math.abs(tonumber(target:sub(2))-tonumber(from:sub(2)))==1 then
+                            obj=replacement; position=pos(obj); to=target; promotion=k
+                            break
+                        end
+                    end
+                end
+            end
+            if to and to~=from then
+                local key=p.kind..from..to..(promotion or "")
+                if not candidates[key] then
+                    candidates[key]={kind=p.kind,from=from,to=to,
+                        promotion=promotion,seen=os.clock(),physical=true}
+                end
+            end
+            -- Invalida respostas enquanto a peça está em trânsito.
+            if position and not at(position,from,0.12) and not p.inTransit then
+                p.inTransit=true
+                revision+=1; pending=nil; clear()
+            elseif position and at(position,from,0.12) then
+                p.inTransit=nil
+            end
+        end
         for key,move in pairs(candidates) do
             if os.clock()-move.seen>30 then candidates[key]=nil; continue end
             local p=state[move.from]
@@ -398,6 +447,10 @@ end)
 local start
 start=button("Iniciar",15,185,function()
     if not side or not whose then title.Text="Escolha teu lado e quem joga agora"; return end
+    if initial and revision==0 then
+        whose="w"
+        log("Tabuleiro inicial: brancas jogam primeiro")
+    end
     userColor,turn=side,whose
     revision+=1; pending=nil; clear()
     log("Teu lado: "..(side=="w" and "brancas" or "pretas").."; vez: "..(whose=="w" and "brancas" or "pretas"))
@@ -413,6 +466,6 @@ end)
 reopen.Parent=gui
 reopen.Position=UDim2.new(0,12,1,-52)
 reopen.Size=UDim2.fromOffset(165,38)
-log("ChessHint 1.2.0 ativo; "..#samples.." peças lidas")
+log("ChessHint 1.3.0 ativo; "..#samples.." peças lidas")
 log("Amarelo = peça; verde = destino. Escolha lado e vez no painel")
 log("Parar: getgenv().ChessHintStop(); dica: getgenv().ChessHintNow()")
