@@ -1,0 +1,5 @@
+termux/.api-key
+termux/bin/
+termux/stockfish-src/
+__pycache__/
+*.pyc
