@@ -1,4 +1,4 @@
--- ChessHint Termux 1.0.2
+-- ChessHint Termux 1.1.0
 local Http = game:GetService("HttpService")
 local Logs = game:GetService("LogService")
 local Players = game:GetService("Players")
@@ -13,6 +13,17 @@ local running, revision = true, 0
 local state, candidates, tiles, diagnostics = {}, {}, {}, {}
 local userColor, turn, pending
 local settings = env.ChessStockfishSettings or {url="", key="", think=1}
+local settingsFile="ChessHintSettings.json"
+if readfile then
+    local ok, saved=pcall(function() return Http:JSONDecode(readfile(settingsFile)) end)
+    if ok and type(saved)=="table" then
+        for _,key in ipairs({"url","key","think","style","aggression"}) do
+            if saved[key]~=nil then settings[key]=saved[key] end
+        end
+    end
+end
+settings.style=settings.style=="attacking" and "attacking" or "precise"
+settings.aggression=math.clamp(tonumber(settings.aggression) or 50,0,100)
 env.ChessStockfishSettings = settings
 local ep, halfmove, fullmove = "-", 0, 1
 local rights = {K=false, Q=false, k=false, q=false}
@@ -343,7 +354,7 @@ local function callApi(f)
         Url=settings.url.."/analyse",Method="POST",
         Headers={["Content-Type"]="application/json",Accept="application/json",
             ["Authorization"]="Bearer "..settings.key},
-        Body=Http:JSONEncode({fen=f,time=settings.think})
+        Body=Http:JSONEncode({fen=f,time=settings.think,style=settings.style,aggression=settings.aggression})
     })
     if not ok or type(response)~="table" then return nil,nil,tostring(response) end
     local decoded,data=pcall(function() return Http:JSONDecode(response.Body) end)
@@ -375,6 +386,12 @@ task.spawn(function()
         end
         if status~=200 or type(data)~="table" or data.error or data.type=="error" then
             log("API rejeitou a consulta: "..tostring(body)); continue
+        end
+        if settings.style=="attacking" and not data.personality_supported then
+            log("Servidor antigo: atualize server.py para ativar personalidade")
+        elseif data.personality_supported then
+            log("Estilo: "..tostring(data.style).." | agressividade "..tostring(data.aggression)
+                .." | diferença da melhor avaliação "..tostring(data.evaluation_loss_cp).." centipeões")
         end
         local engineTime=tonumber(data.time)
         local nodes=tonumber(data.nodes)
@@ -432,7 +449,7 @@ local corner=Instance.new("UICorner"); corner.Parent=frame
 local content=Instance.new("ScrollingFrame")
 content.Position=UDim2.fromOffset(0,64); content.Size=UDim2.new(1,0,1,-64)
 content.BackgroundTransparency=1; content.BorderSizePixel=0
-content.CanvasSize=UDim2.fromOffset(0,405); content.ScrollBarThickness=5
+content.CanvasSize=UDim2.fromOffset(0,565); content.ScrollBarThickness=5
 content.ScrollingDirection=Enum.ScrollingDirection.Y; content.Parent=frame
 local function label(text,y)
     local l=Instance.new("TextLabel")
@@ -487,8 +504,23 @@ label("Servidor Stockfish no Termux",154)
 local urlBox=input("https://...trycloudflare.com",184,settings.url)
 local keyBox=input("Chave exibida no Termux",238,settings.key)
 local timeBox=input("Segundos por análise (0.1 a 10)",292,tostring(settings.think))
+label("Personalidade",342)
+local preciseButton,attackButton
+local function refreshStyle()
+    preciseButton.Text=(settings.style=="precise" and "✓ " or "").."Preciso"
+    attackButton.Text=(settings.style=="attacking" and "✓ " or "").."Atacante"
+end
+preciseButton=button("Preciso",15,372,function()
+    settings.style="precise"; refreshStyle()
+end)
+attackButton=button("Atacante",180,372,function()
+    settings.style="attacking"; refreshStyle()
+end)
+refreshStyle()
+label("Agressividade: 0 a 100",422)
+local aggressionBox=input("0 = conservador; 100 = mais ousado",452,tostring(settings.aggression))
 local start
-start=button("Iniciar / salvar",15,348,function()
+start=button("Iniciar / salvar",15,508,function()
     if not side or not whose then title.Text="Escolha teu lado e quem joga agora"; return end
     local url=urlBox.Text:match("^%s*(.-)%s*$"):gsub("/+$","")
     if not url:match("^https://[%w%.%-]+$") then
@@ -498,7 +530,18 @@ start=button("Iniciar / salvar",15,348,function()
     local seconds=tonumber(timeBox.Text)
     if key=="" then title.Text="Cole a chave do Termux"; return end
     if not seconds or seconds<0.1 or seconds>10 then title.Text="Use de 0.1 a 10 segundos"; return end
+    local aggression=tonumber(aggressionBox.Text)
+    if not aggression or aggression<0 or aggression>100 then
+        title.Text="Agressividade: use de 0 a 100"; return
+    end
     settings.url,settings.key,settings.think=url,key,seconds
+    settings.aggression=aggression
+    if writefile then
+        local saved=pcall(function() writefile(settingsFile,Http:JSONEncode(settings)) end)
+        log(saved and "Configurações salvas em "..settingsFile or "Falha ao salvar arquivo; configurações mantidas nesta sessão")
+    else
+        log("Executor sem writefile: configurações salvas somente nesta sessão")
+    end
     if initial and revision==0 then
         whose="w"
         log("Tabuleiro inicial: brancas jogam primeiro")
@@ -509,7 +552,7 @@ start=button("Iniciar / salvar",15,348,function()
     frame.Visible=false
     queue()
 end)
-button("Parar",180,348,function() env.ChessHintStop() end)
+button("Parar",180,508,function() env.ChessHintStop() end)
 local reopen=button("Configurar / dica",15,240,function()
     frame.Visible=true
     env.ChessHintNow()
@@ -567,7 +610,7 @@ watch(Input.InputEnded,function(input)
 end)
 watch(root:GetPropertyChangedSignal("AbsoluteSize"),layout)
 layout()
-log("ChessHint Termux 1.0.2 ativo; "..#samples.." peças lidas")
+log("ChessHint Termux 1.1.0 ativo; "..#samples.." peças lidas")
 log("Arraste pelo título; role o painel para acessar todos os campos")
 log("Amarelo = peça; verde = destino. Escolha lado e vez no painel")
 log("Parar: getgenv().ChessHintStop(); dica: getgenv().ChessHintNow()")
