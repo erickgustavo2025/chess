@@ -56,9 +56,11 @@ def select_line(board, lines, style, aggression):
 
 
 class Service:
-    def __init__(self, engine, key):
+    def __init__(self, engine, key, force_precise=False, adaptive_time=False):
         self.engine, self.key = engine, key
         self.lock = threading.Lock()
+        self.force_precise = force_precise
+        self.adaptive_time = adaptive_time
 
     def analyse(self, payload):
         if not isinstance(payload, dict):
@@ -78,6 +80,16 @@ class Service:
         aggression = float(payload.get("aggression", 0))
         if not math.isfinite(aggression) or not 0 <= aggression <= 100:
             raise ValueError("Agressividade deve estar entre 0 e 100")
+        if self.force_precise:
+            style, aggression = "precise", 0
+        requested_seconds = seconds
+        legal = list(board.legal_moves)
+        # Conservative heuristic: tactical positions retain the full budget.
+        tactical = board.is_check() or any(board.is_capture(m) or m.promotion or board.gives_check(m) for m in legal)
+        if self.adaptive_time and not tactical:
+            seconds = max(0.1, requested_seconds * 0.75)
+        if self.adaptive_time and len(legal) == 1:
+            seconds = min(seconds, 0.1)
         outcome = board.outcome()
         if outcome:
             return {"game_over": True, "result": outcome.result(),
@@ -101,7 +113,9 @@ class Service:
                     "time": info.get("time"), "engine": self.engine.id.get("name"),
                     "fen": fen, "game_over": False, "style": style,
                     "aggression": aggression, "evaluation_loss_cp": loss,
-                    "personality_supported": True, "multipv": count}
+                    "personality_supported": not self.force_precise, "multipv": count,
+                    "requested_time": requested_seconds, "search_budget": seconds,
+                    "adaptive_time": self.adaptive_time}
         finally:
             self.lock.release()
 
@@ -170,6 +184,8 @@ def main():
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--hash", type=int, default=128)
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--force-precise", action="store_true")
+    parser.add_argument("--adaptive-time", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.threads <= 16 or not 16 <= args.hash <= 65536:
         parser.error("threads: 1–16; hash: 16–65536 MB")
@@ -181,9 +197,10 @@ def main():
     if not key:
         raise SystemExit("Arquivo .api-key vazio")
     with chess.engine.SimpleEngine.popen_uci(args.engine, timeout=20) as engine:
-        engine.configure({"Threads": args.threads, "Hash": args.hash})
+        engine.configure({"Threads": args.threads, "Hash": args.hash,
+                          "Skill Level": 20, "UCI_LimitStrength": False})
         server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-        server.service = Service(engine, key)
+        server.service = Service(engine, key, args.force_precise, args.adaptive_time)
         print("Motor:", engine.id.get("name"), flush=True)
         print("Chave para colar no painel:", key, flush=True)
         print(f"Servidor: http://127.0.0.1:{args.port}", flush=True)
