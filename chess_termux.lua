@@ -1,4 +1,4 @@
--- ChessHint Termux 1.0.0
+-- ChessHint Termux 1.0.1
 local Http = game:GetService("HttpService")
 local Logs = game:GetService("LogService")
 local Players = game:GetService("Players")
@@ -17,6 +17,7 @@ env.ChessStockfishSettings = settings
 local ep, halfmove, fullmove = "-", 0, 1
 local rights = {K=false, Q=false, k=false, q=false}
 local connection, gui
+local uiConnections = {}
 local visuals = Instance.new("Folder")
 visuals.Name = "ChessHints"
 visuals.Parent = workspace
@@ -36,6 +37,8 @@ env.ChessHintStop = function()
     running = false
     pending = nil
     if connection then connection:Disconnect() end
+    for _, link in ipairs(uiConnections) do link:Disconnect() end
+    table.clear(uiConnections)
     if gui then gui:Destroy() end
     if visuals.Parent then visuals:Destroy() end
 end
@@ -403,60 +406,75 @@ end)
 gui=Instance.new("ScreenGui")
 gui.Name="ChessHintControls"; gui.ResetOnSpawn=false
 gui.DisplayOrder=999999; gui.Parent=Player:WaitForChild("PlayerGui")
+local Input=game:GetService("UserInputService")
+local root=Instance.new("Frame")
+root.Size=UDim2.fromScale(1,1); root.BackgroundTransparency=1
+root.Parent=gui
 local frame=Instance.new("Frame")
-frame.Size=UDim2.fromOffset(350,370)
-frame.Position=UDim2.new(0.5,-175,0,85)
-frame.BackgroundColor3=Color3.fromRGB(28,31,39); frame.Parent=gui
+frame.Size=UDim2.fromOffset(350,450)
+frame.BackgroundColor3=Color3.fromRGB(28,31,39); frame.Parent=root
+frame.BorderSizePixel=0; frame.ClipsDescendants=true
 local corner=Instance.new("UICorner"); corner.Parent=frame
+local content=Instance.new("ScrollingFrame")
+content.Position=UDim2.fromOffset(0,64); content.Size=UDim2.new(1,0,1,-64)
+content.BackgroundTransparency=1; content.BorderSizePixel=0
+content.CanvasSize=UDim2.fromOffset(0,405); content.ScrollBarThickness=5
+content.ScrollingDirection=Enum.ScrollingDirection.Y; content.Parent=frame
 local function label(text,y)
     local l=Instance.new("TextLabel")
     l.Size=UDim2.new(1,0,0,28); l.Position=UDim2.fromOffset(0,y)
     l.BackgroundTransparency=1; l.Text=text; l.TextSize=16
-    l.TextColor3=Color3.new(1,1,1); l.Font=Enum.Font.GothamBold; l.Parent=frame
+    l.TextColor3=Color3.new(1,1,1); l.Font=Enum.Font.GothamBold; l.Parent=content
     return l
 end
 local title=label("Xadrez — escolha teu lado e a vez",5)
-label("Teu lado",35); label("Quem joga agora?",105)
+title.Parent=frame; title.Size=UDim2.new(1,-68,0,54)
+title.Position=UDim2.fromOffset(12,4); title.TextSize=15; title.TextWrapped=true
+local handle=Instance.new("TextButton")
+handle.Text=""; handle.BackgroundTransparency=1
+handle.Size=UDim2.new(1,-60,0,64); handle.Parent=frame
+label("Teu lado",0); label("Quem joga agora?",76)
 local function button(text,x,y,callback)
     local b=Instance.new("TextButton")
-    b.Size=UDim2.fromOffset(155,38); b.Position=UDim2.fromOffset(x,y)
+    b.Size=UDim2.new(0.5,-22,0,44)
+    b.Position=UDim2.new(x==15 and 0 or 0.5,x==15 and 15 or 7,0,y)
     b.Text=text; b.TextSize=15; b.Font=Enum.Font.GothamBold
     b.TextColor3=Color3.new(1,1,1); b.BackgroundColor3=Color3.fromRGB(65,76,130)
-    b.Parent=frame
+    b.Parent=content; b.TextWrapped=true
     local c=Instance.new("UICorner"); c.Parent=b
     b.Activated:Connect(callback)
     return b
 end
 local side,whose
 local wb,bb,wt,bt
-wb=button("Brancas",15,65,function()
+wb=button("Brancas",15,28,function()
     side="w"; wb.Text="✓ Brancas"; bb.Text="Pretas"
 end)
-bb=button("Pretas",180,65,function()
+bb=button("Pretas",180,28,function()
     side="b"; bb.Text="✓ Pretas"; wb.Text="Brancas"
 end)
-wt=button("Brancas jogam",15,135,function()
+wt=button("Brancas jogam",15,104,function()
     whose="w"; wt.Text="✓ Brancas jogam"; bt.Text="Pretas jogam"
 end)
-bt=button("Pretas jogam",180,135,function()
+bt=button("Pretas jogam",180,104,function()
     whose="b"; bt.Text="✓ Pretas jogam"; wt.Text="Brancas jogam"
 end)
 local function input(placeholder,y,text)
     local box=Instance.new("TextBox")
-    box.Size=UDim2.fromOffset(320,34); box.Position=UDim2.fromOffset(15,y)
+    box.Size=UDim2.new(1,-30,0,44); box.Position=UDim2.fromOffset(15,y)
     box.BackgroundColor3=Color3.fromRGB(45,48,58)
     box.TextColor3=Color3.new(1,1,1); box.TextSize=14
     box.PlaceholderText=placeholder; box.Text=text or ""
     box.ClearTextOnFocus=false; box.Font=Enum.Font.Gotham
-    box.Parent=frame
+    box.Parent=content
     return box
 end
-label("Servidor Stockfish no Termux",178)
-local urlBox=input("https://...trycloudflare.com",208,settings.url)
-local keyBox=input("Chave exibida no Termux",249,settings.key)
-local timeBox=input("Segundos por análise (0.1 a 10)",290,tostring(settings.think))
+label("Servidor Stockfish no Termux",154)
+local urlBox=input("https://...trycloudflare.com",184,settings.url)
+local keyBox=input("Chave exibida no Termux",238,settings.key)
+local timeBox=input("Segundos por análise (0.1 a 10)",292,tostring(settings.think))
 local start
-start=button("Iniciar / salvar",15,330,function()
+start=button("Iniciar / salvar",15,348,function()
     if not side or not whose then title.Text="Escolha teu lado e quem joga agora"; return end
     local url=urlBox.Text:match("^%s*(.-)%s*$"):gsub("/+$","")
     if not url:match("^https://[%w%.%-]+$") then
@@ -477,16 +495,66 @@ start=button("Iniciar / salvar",15,330,function()
     frame.Visible=false
     queue()
 end)
-button("Parar",180,330,function() env.ChessHintStop() end)
+button("Parar",180,348,function() env.ChessHintStop() end)
 local reopen=button("Configurar / dica",15,240,function()
     frame.Visible=true
     env.ChessHintNow()
 end)
 -- Mantém um botão acessível mesmo com o painel fechado.
-reopen.Parent=gui
-reopen.Position=UDim2.new(0,12,1,-52)
-reopen.Size=UDim2.fromOffset(165,38)
-log("ChessHint Termux 1.0.0 ativo; "..#samples.." peças lidas")
+reopen.Parent=root
+reopen.Size=UDim2.fromOffset(165,44)
+local minimize=button("—",15,0,function() frame.Visible=false end)
+minimize.Parent=frame; minimize.Size=UDim2.fromOffset(44,44)
+minimize.Position=UDim2.new(1,-52,0,10)
+local function watch(signal,fn)
+    table.insert(uiConnections,signal:Connect(fn))
+end
+local placed=false
+local function clampPosition(target,x,y)
+    local area=root.AbsoluteSize
+    local size=target.AbsoluteSize
+    target.Position=UDim2.fromOffset(
+        math.clamp(x,0,math.max(0,area.X-size.X)),
+        math.clamp(y,0,math.max(0,area.Y-size.Y)))
+end
+local function layout()
+    local area=root.AbsoluteSize
+    if area.X<=0 or area.Y<=0 then return end
+    frame.Size=UDim2.fromOffset(math.min(380,math.max(1,area.X-16)),math.min(470,math.max(1,area.Y-16)))
+    if not placed then
+        frame.Position=UDim2.fromOffset((area.X-frame.Size.X.Offset)/2,8)
+        placed=true
+    else
+        clampPosition(frame,frame.Position.X.Offset,frame.Position.Y.Offset)
+    end
+    reopen.Size=UDim2.fromOffset(math.min(165,area.X),math.min(44,area.Y))
+    reopen.Position=UDim2.fromOffset(8,math.max(0,area.Y-52))
+    clampPosition(reopen,8,math.max(0,area.Y-52))
+end
+-- Só o cabeçalho arrasta: campos e rolagem continuam recebendo toque.
+local dragging,origin,panelOrigin
+watch(handle.InputBegan,function(input)
+    if input.UserInputType==Enum.UserInputType.Touch
+        or input.UserInputType==Enum.UserInputType.MouseButton1 then
+        if dragging then return end
+        dragging=input; origin=input.Position; panelOrigin=frame.Position
+    end
+end)
+watch(Input.InputChanged,function(input)
+    if not dragging then return end
+    local touch=dragging.UserInputType==Enum.UserInputType.Touch
+    if (touch and input~=dragging)
+        or (not touch and input.UserInputType~=Enum.UserInputType.MouseMovement) then return end
+    local delta=input.Position-origin
+    clampPosition(frame,panelOrigin.X.Offset+delta.X,panelOrigin.Y.Offset+delta.Y)
+end)
+watch(Input.InputEnded,function(input)
+    if input==dragging then dragging=nil end
+end)
+watch(root:GetPropertyChangedSignal("AbsoluteSize"),layout)
+layout()
+log("ChessHint Termux 1.0.1 ativo; "..#samples.." peças lidas")
+log("Arraste pelo título; role o painel para acessar todos os campos")
 log("Amarelo = peça; verde = destino. Escolha lado e vez no painel")
 log("Parar: getgenv().ChessHintStop(); dica: getgenv().ChessHintNow()")
 
