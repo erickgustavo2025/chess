@@ -171,8 +171,8 @@ def main():
     parser.add_argument("--hash", type=int, default=128)
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
-    if not 1 <= args.threads <= 16 or not 16 <= args.hash <= 1024:
-        parser.error("threads: 1–16; hash: 16–1024 MB")
+    if not 1 <= args.threads <= 16 or not 16 <= args.hash <= 65536:
+        parser.error("threads: 1–16; hash: 16–65536 MB")
     key_path = ROOT / ".api-key"
     if not key_path.exists():
         key_path.write_text(secrets.token_urlsafe(32) + "\n")
