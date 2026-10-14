@@ -1,20 +1,48 @@
--- ChessHint 1.3.0
+-- Luau / chess.lua / Roblox client + executor HTTP / ChessHint 2.0.0
 local Http = game:GetService("HttpService")
-local Logs = game:GetService("LogService")
 local Players = game:GetService("Players")
 local Player = Players.LocalPlayer
 local env = getgenv()
 if env.ChessHintStop then pcall(env.ChessHintStop) end
 local requestFn = request or http_request or (syn and syn.request)
 assert(requestFn, "[Xadrez] Executor sem request")
-local Pieces = workspace:WaitForChild("Pieces")
-local Board = workspace:WaitForChild("Board")
-local running, revision = true, 0
-local state, candidates, tiles, diagnostics = {}, {}, {}, {}
-local userColor, turn, pending
-local ep, halfmove, fullmove = "-", 0, 1
-local rights = {K=false, Q=false, k=false, q=false}
-local connection, gui
+local Pieces = workspace:WaitForChild("Pieces", 15)
+assert(Pieces, "[Xadrez] Pasta Pieces ausente; execute dentro de uma partida")
+local Board = workspace:WaitForChild("Board", 15)
+assert(Board, "[Xadrez] Board ausente")
+local running = true
+local generation = 0
+local state, tiles, diagnostics = {}, {}, {}
+local sessionId, serverRevision, enabled = nil, 0, false
+local requestSerial, retryAt = 0, 0
+local initialFenBox
+local statusLabel
+local function status(text)
+    if statusLabel then statusLabel.Text = text end
+end
+local userColor, turn
+local settings = type(env.ChessStockfishSettings)=="table" and env.ChessStockfishSettings or {}
+settings.url=type(settings.url)=="string" and settings.url or ""
+settings.key=type(settings.key)=="string" and settings.key or ""
+settings.think=tonumber(settings.think) or 1
+local settingsFile="ChessHintSettings.json"
+if readfile then
+    local ok, saved=pcall(function() return Http:JSONDecode(readfile(settingsFile)) end)
+    if ok and type(saved)=="table" then
+        for _,key in ipairs({"url","think","style","aggression"}) do
+            if saved[key]~=nil then settings[key]=saved[key] end
+        end
+    end
+end
+settings.url=type(settings.url)=="string" and settings.url or ""
+settings.think=tonumber(settings.think) or 1
+if settings.think~=settings.think then settings.think=1 end
+settings.think=math.clamp(settings.think,0.1,10)
+settings.style=settings.style=="attacking" and "attacking" or "precise"
+settings.aggression=math.clamp(tonumber(settings.aggression) or 50,0,100)
+env.ChessStockfishSettings = settings
+local gui
+local uiConnections = {}
 local visuals = Instance.new("Folder")
 visuals.Name = "ChessHints"
 visuals.Parent = workspace
@@ -32,8 +60,8 @@ env.ChessCopyLogs = function()
 end
 env.ChessHintStop = function()
     running = false
-    pending = nil
-    if connection then connection:Disconnect() end
+    for _, link in ipairs(uiConnections) do link:Disconnect() end
+    table.clear(uiConnections)
     if gui then gui:Destroy() end
     if visuals.Parent then visuals:Destroy() end
 end
@@ -54,8 +82,29 @@ local function kind(obj)
         if name:find(word, 1, true) then return letter end
     end
 end
+-- Named anchors calibrate moved/rotated boards. Original game coordinates are the fallback.
+local anchors={}
+for _,tile in ipairs(Board:GetDescendants()) do
+    if tile:IsA("BasePart") then
+        local name=tile.Name:lower()
+        if name=="a1" or name=="b1" or name=="a2" then anchors[name]=tile.Position end
+    end
+end
+local custom=env.ChessBoardCalibration
+if type(custom)=="table" then
+    anchors.a1=custom.a1; anchors.b1=custom.b1; anchors.a2=custom.a2
+end
+if not (anchors.a1 and anchors.b1 and anchors.a2) then anchors={} end
+local a1=anchors.a1 or Vector3.new(1032,0,4)
+local fileStep=(anchors.b1 or Vector3.new(1028,0,4))-a1
+local rankStep=(anchors.a2 or Vector3.new(1032,0,8))-a1
+fileStep=Vector3.new(fileStep.X,0,fileStep.Z)
+rankStep=Vector3.new(rankStep.X,0,rankStep.Z)
+local determinant=fileStep.X*rankStep.Z-fileStep.Z*rankStep.X
+assert(math.abs(determinant)>0.01,"[Xadrez] Calibração do tabuleiro inválida")
 local function center(square)
-    return 1036 - (square:byte(1)-96)*4, tonumber(square:sub(2))*4
+    local v=a1+fileStep*(square:byte(1)-97)+rankStep*(tonumber(square:sub(2))-1)
+    return v.X,v.Z
 end
 local function at(p, square, tolerance)
     if not p then return false end
@@ -64,7 +113,9 @@ local function at(p, square, tolerance)
 end
 local function squareAt(p)
     if not p then return end
-    local f,r = math.round((1036-p.X)/4), math.round(p.Z/4)
+    local dx,dz=p.X-a1.X,p.Z-a1.Z
+    local f=math.round((dx*rankStep.Z-dz*rankStep.X)/determinant)+1
+    local r=math.round((fileStep.X*dz-fileStep.Z*dx)/determinant)+1
     if f<1 or f>8 or r<1 or r>8 then return end
     local square = string.char(96+f)..r
     if at(p,square,0.7) then return square end
@@ -127,204 +178,68 @@ for _,item in ipairs(samples) do
     if item.kind=="k" then kings[c]+=1 end
 end
 if kings.w~=1 or kings.b~=1 then fail("Não identifiquei exatamente um rei de cada lado") end
-local function has(s,c,k)
-    local p=state[s]
-    return p and p.color==c and p.kind==k
-end
--- Em partida já iniciada, não inventa direitos de roque desconhecidos.
-local initial=true
-local back="rnbqkbnr"
-for f=1,8 do
-    local file=string.char(96+f)
-    if not has(file.."1","w",back:sub(f,f))
-        or not has(file.."2","w","p")
-        or not has(file.."7","b","p")
-        or not has(file.."8","b",back:sub(f,f)) then initial=false end
-end
-if initial and #samples==32 then
-    rights={K=true,Q=true,k=true,q=true}
-else
-    log("Início no meio da partida: roque e en passant anteriores são desconhecidos")
-end
-local function fen()
+local function snapshot()
+    local observed, kings, count = {}, {w=0,b=0}, 0
+    for _,obj in ipairs(Pieces:GetChildren()) do
+        local k=kind(obj)
+        if k then
+            local position=pos(obj)
+            local sq=squareAt(position)
+            if not sq or not at(position,sq,0.12) or observed[sq] then return nil end
+            local c=colorOf(obj)
+            if not c then return nil end
+            observed[sq]={instance=obj,kind=k,color=c}
+            count=count+1
+            if k=="k" then kings[c]=kings[c]+1 end
+        end
+    end
+    if count>32 or kings.w~=1 or kings.b~=1 then return nil end
     local rows={}
     for r=8,1,-1 do
         local line,empty="",0
         for f=1,8 do
-            local p=state[string.char(96+f)..r]
-            if p then
-                if empty>0 then line..=empty; empty=0 end
-                line..=(p.color=="w" and p.kind:upper() or p.kind)
-            else empty+=1 end
+            local piece=observed[string.char(96+f)..r]
+            if piece then
+                if empty>0 then line=line..empty; empty=0 end
+                line=line..(piece.color=="w" and piece.kind:upper() or piece.kind)
+            else empty=empty+1 end
         end
-        if empty>0 then line..=empty end
+        if empty>0 then line=line..empty end
         table.insert(rows,line)
     end
-    local castle=""
-    for _,key in ipairs({"K","Q","k","q"}) do
-        if rights[key] then castle..=key end
-    end
-    return table.concat(rows,"/").." "..turn.." "..(castle~="" and castle or "-")
-        .." "..ep.." "..halfmove.." "..fullmove
+    return table.concat(rows,"/"),observed
 end
-local function queue()
-    if running and turn and turn==userColor then
-        pending={fen=fen(),version=revision,ready=os.clock()+0.3,attempts=0}
+local function callApi(path,payload,credentials)
+    credentials=credentials or settings
+    local ok,response=pcall(requestFn,{
+        Url=credentials.url..path,Method="POST",Timeout=20,
+        Headers={["Content-Type"]="application/json",Accept="application/json",
+            ["Authorization"]="Bearer "..credentials.key},
+        Body=Http:JSONEncode(payload)
+    })
+    if not ok or type(response)~="table" then return nil,nil end
+    local decoded,data=pcall(function() return Http:JSONDecode(response.Body) end)
+    return tonumber(response.StatusCode or response.Status),decoded and data or nil
+end
+local function discardSession()
+    local old=sessionId
+    local credentials={url=settings.url,key=settings.key}
+    sessionId=nil; serverRevision=0
+    if old then
+        task.spawn(function() callApi("/close",{session=old},credentials) end)
     end
 end
+local force=true
+local initialFen=""
 env.ChessHintNow=function()
     if not running then return end
-    revision+=1; pending=nil; clear(); queue()
-    if turn~=userColor then log("Aguardando a vez do teu lado") end
+    requestSerial=requestSerial+1; force=true; retryAt=0; clear()
 end
-local rookRights={a1="Q",h1="K",a8="q",h8="k"}
-local function promoted(move,piece)
-    local used={}
-    for s,p in pairs(state) do
-        if s~=move.from and s~=move.to then used[p.instance]=true end
-    end
-    for _,obj in ipairs(Pieces:GetChildren()) do
-        if not used[obj] and kind(obj)==move.promotion
-            and colorOf(obj)==piece.color and at(pos(obj),move.to,0.12) then return obj end
-    end
+local oldStop=env.ChessHintStop
+env.ChessHintStop=function()
+    enabled=false; generation=generation+1; requestSerial=requestSerial+1
+    discardSession(); oldStop()
 end
-local function apply(move)
-    local p=state[move.from]
-    if not p or p.color~=turn or p.kind~=move.kind then return false end
-    local victim=state[move.to]
-    if victim and victim.color==p.color then return false end
-    local pawn=p.kind=="p"
-    local captureSquare=move.to
-    if pawn and move.from:sub(1,1)~=move.to:sub(1,1) and not victim then
-        if move.to~=ep then return false end
-        captureSquare=move.to:sub(1,1)..move.from:sub(2)
-        victim=state[captureSquare]
-        if not victim or victim.kind~="p" or victim.color==p.color then return false end
-    end
-    local newInstance
-    if pawn and move.to:sub(2)==(p.color=="w" and "8" or "1") then
-        if not move.promotion then return false end
-        newInstance=promoted(move,p)
-        if not newInstance then return false end
-    end
-    local rf,rt
-    if p.kind=="k" and math.abs(move.to:byte(1)-move.from:byte(1))==2 then
-        local r=p.color=="w" and "1" or "8"
-        rf=(move.to:sub(1,1)=="g" and "h" or "a")..r
-        rt=(move.to:sub(1,1)=="g" and "f" or "d")..r
-        if not has(rf,p.color,"r") or not at(pos(state[rf].instance),rt,0.12) then return false end
-    end
-    if victim then
-        if victim.kind=="r" and rookRights[captureSquare] then rights[rookRights[captureSquare]]=false end
-        state[captureSquare]=nil
-    end
-    if p.kind=="k" then
-        if p.color=="w" then rights.K=false; rights.Q=false
-        else rights.k=false; rights.q=false end
-    elseif p.kind=="r" and rookRights[move.from] then rights[rookRights[move.from]]=false end
-    state[move.from]=nil; state[move.to]=p
-    if rf then state[rt]=state[rf]; state[rf]=nil end
-    ep="-"
-    if pawn and math.abs(tonumber(move.to:sub(2))-tonumber(move.from:sub(2)))==2 then
-        ep=move.from:sub(1,1)..math.floor((tonumber(move.to:sub(2))+tonumber(move.from:sub(2)))/2)
-    end
-    if newInstance then p.kind=move.promotion; p.instance=newInstance end
-    halfmove=(pawn or victim) and 0 or halfmove+1
-    if p.color=="b" then fullmove+=1 end
-    p.inTransit=nil
-    turn=p.color=="w" and "b" or "w"
-    revision+=1; pending=nil; clear()
-    log("Confirmado: "..move.from.." → "..move.to..(move.promotion and " promoção "..move.promotion or ""))
-    queue()
-    return true
-end
-connection=Logs.MessageOut:Connect(function(message)
-    if not running or message:find("[Xadrez]",1,true) then return end
-    local text=message:match("^%s*(.-)%s*$")
-    local k,from,to,suffix=text:match("^([PNBRQKpnbrqk])%-([a-h][1-8])%-([a-h][1-8])(.*)$")
-    if not k then return end
-    local promotion=suffix:match("%-promotion%-([QRBNqrbn])") or suffix:match("=([QRBNqrbn])")
-    promotion=promotion and promotion:lower()
-    local key=k:lower()..from..to..(promotion or "")
-    candidates[key]={kind=k:lower(),from=from,to=to,promotion=promotion,seen=os.clock()}
-end)
-task.spawn(function()
-    while running do
-        task.wait(0.05)
-        if not running then break end
-        if not turn then continue end
-        -- Partidas humanas podem não produzir nenhum registro de jogada.
-        -- Detecta deslocamento real antes de consultar os candidatos do console.
-        local used={}
-        for _,p in pairs(state) do used[p.instance]=true end
-        for from,p in pairs(state) do
-            if p.color~=turn then continue end
-            local obj=p.instance
-            local position=obj and obj.Parent==Pieces and pos(obj)
-            local to=squareAt(position)
-            local promotion
-            if p.kind=="p" then
-                local lastRank=p.color=="w" and "8" or "1"
-                if to and to:sub(2)==lastRank then
-                    local changed=kind(obj)
-                    if changed and changed~="p" then promotion=changed end
-                end
-                -- A promoção também pode destruir o peão e criar outro modelo.
-                if not position or (to and to:sub(2)==lastRank) then
-                    for _,replacement in ipairs(Pieces:GetChildren()) do
-                        local k=kind(replacement)
-                        local target=squareAt(pos(replacement))
-                        if (not used[replacement] or replacement==obj)
-                            and (k=="q" or k=="r" or k=="b" or k=="n")
-                            and colorOf(replacement)==p.color and target
-                            and target:sub(2)==lastRank
-                            and math.abs(target:byte(1)-from:byte(1))<=1
-                            and math.abs(tonumber(target:sub(2))-tonumber(from:sub(2)))==1 then
-                            obj=replacement; position=pos(obj); to=target; promotion=k
-                            break
-                        end
-                    end
-                end
-            end
-            if to and to~=from then
-                local key=p.kind..from..to..(promotion or "")
-                if not candidates[key] then
-                    candidates[key]={kind=p.kind,from=from,to=to,
-                        promotion=promotion,seen=os.clock(),physical=true}
-                end
-            end
-            -- Invalida respostas enquanto a peça está em trânsito.
-            if position and not at(position,from,0.12) and not p.inTransit then
-                p.inTransit=true
-                revision+=1; pending=nil; clear()
-            elseif position and at(position,from,0.12) then
-                p.inTransit=nil
-            end
-        end
-        for key,move in pairs(candidates) do
-            if os.clock()-move.seen>30 then candidates[key]=nil; continue end
-            local p=state[move.from]
-            if not p or p.color~=turn or p.kind~=move.kind then continue end
-            local obj=move.promotion and promoted(move,p) or p.instance
-            local position=obj and obj.Parent==Pieces and pos(obj)
-            local still=position and move.last and (position-move.last).Magnitude<0.01
-            move.last=position
-            if position and at(position,move.to,0.12) and still then
-                move.stable=move.stable or os.clock()
-                if os.clock()-move.stable>=0.25 and apply(move) then
-                    -- Descarta alternativas hipotéticas do lado que acabou de jogar.
-                    for other,m in pairs(candidates) do
-                        local source=state[m.from]
-                        if not source or source.color~=turn then candidates[other]=nil
-                        else m.stable=nil; m.last=nil end
-                    end
-                    candidates[key]=nil
-                    break
-                end
-            else move.stable=nil end
-        end
-    end
-end)
 local function highlight(obj,c)
     if not obj or not obj.Parent then return end
     local h=Instance.new("Highlight")
@@ -333,139 +248,333 @@ local function highlight(obj,c)
     h.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
     h.Parent=visuals
 end
-local function callApi(f)
-    local ok,response=pcall(requestFn,{
-        Url="https://chess-api.com/v1",Method="POST",
-        Headers={["Content-Type"]="application/json",Accept="application/json"},
-        Body=Http:JSONEncode({fen=f,depth=18,variants=1,maxThinkingTime=100})
-    })
-    if not ok or type(response)~="table" then return nil,nil,tostring(response) end
-    local decoded,data=pcall(function() return Http:JSONDecode(response.Body) end)
-    return tonumber(response.StatusCode or response.Status),decoded and data or nil,response.Body
-end
 task.spawn(function()
-    local last=-math.huge
+    local previous,stableSince,lastSent=nil,os.clock(),nil
+    local inFlight=false
+    local failures=0
     while running do
-        task.wait(0.2)
-        local job=pending
-        if not job or os.clock()<job.ready or os.clock()-last<3 then continue end
-        pending=nil
-        if job.version~=revision then continue end
-        last=os.clock()
-        log("Consultando FEN: "..job.fen)
-        local status,data,body=callApi(job.fen)
-        if not running or job.version~=revision then continue end
-        if type(data)=="table" and data.error=="INVALID_FEN_VALIDATION_ERROR" then
-            local fields=string.split(job.fen," ")
-            if fields[4]~="-" then
-                fields[4]="-"
-                log("API rejeitou en passant; tentando análise sem esse direito, preservando o estado")
-                status,data,body=callApi(table.concat(fields," "))
-            end
+        task.wait(0.1)
+        local placement,observed=snapshot()
+        local signature=placement or "moving"
+        if signature~=previous then
+            previous=signature; stableSince=os.clock()
+            requestSerial=requestSerial+1; force=true; clear()
+            if enabled then status(placement and "Aguardando estabilidade..." or "Peças em movimento...") end
         end
-        if not running or job.version~=revision then continue end
-        if not status or status==429 or status>=500 then
-            job.attempts+=1
-            if job.attempts<=3 then
-                job.ready=os.clock()+(status==429 and 30 or 5)
-                pending=job
-                log("Falha temporária; nova tentativa agendada")
-            else log("Consulta falhou: "..tostring(body)) end
-            continue
+        if enabled and placement and os.clock()-stableSince>=0.6
+            and not inFlight and os.clock()>=retryAt
+            and (placement~=lastSent or force) then
+            local serial=requestSerial
+            local jobGeneration=generation
+            local jobSettings=table.clone(settings)
+            local jobPlacement=placement
+            local jobObserved=observed
+            inFlight=true; force=false
+            task.spawn(function()
+                local function fail(code,data)
+                    failures=failures+1
+                    local detail=type(data)=="table" and (data.text or data.error) or "Sem resposta HTTP"
+                    if code==401 then
+                        enabled=false; status("Chave incorreta; confira Configurar")
+                    elseif code==409 and data and data.error~="DESYNC" then
+                        enabled=false; status(detail.."; clique Iniciar / resincronizar")
+                    elseif code==400 or code==404 then
+                        enabled=false; status(detail.."; confira servidor v2 e configuração")
+                    elseif failures>=6 then
+                        enabled=false; status(tostring(detail).."; consultas pausadas. Abra Configurar e reinicie.")
+                    else
+                        local delay=code==429 and 1 or math.min(8,0.5*2^math.min(failures,4))
+                        retryAt=os.clock()+delay; force=true
+                        status(detail)
+                    end
+                    log("Consulta: "..tostring(code).." | "..tostring(detail))
+                end
+                local code,data
+                if not sessionId then
+                    code,data=callApi("/session",{placement=jobPlacement,turn=turn,
+                        initial_fen=initialFen~="" and initialFen or nil},jobSettings)
+                    if code==200 and type(data)=="table" and type(data.session)=="string" then
+                        if not running or not enabled or jobGeneration~=generation then
+                            callApi("/close",{session=data.session},jobSettings); inFlight=false; return
+                        end
+                        sessionId=data.session; serverRevision=data.revision
+                        initialFen=""
+                        if not data.history_complete then log("Histórico anterior desconhecido: use FEN completa para direitos de roque/en passant") end
+                    else
+                        if running and serial==requestSerial and jobGeneration==generation then fail(code,data) end
+                        inFlight=false; return
+                    end
+                else
+                    code,data=callApi("/sync",{session=sessionId,placement=jobPlacement,revision=serverRevision},jobSettings)
+                    if jobGeneration~=generation then inFlight=false; force=true; return end
+                    if code==200 and type(data)=="table" then
+                        serverRevision=data.revision
+                    else
+                        if running and serial==requestSerial and jobGeneration==generation then fail(code,data) end
+                        inFlight=false; return
+                    end
+                end
+                if not running or not enabled or serial~=requestSerial or jobGeneration~=generation then inFlight=false; force=true; return end
+                state=jobObserved
+                local fen=data.fen
+                local fields=type(fen)=="string" and string.split(fen," ") or {}
+                turn=fields[2]
+                if data.last_move then log("Confirmado: "..data.last_move) end
+                if turn~=userColor then
+                    lastSent=jobPlacement; failures=0; status("Aguardando o adversário")
+                    inFlight=false; return
+                end
+                status("Stockfish analisando...")
+                local sentAt=os.clock()
+                code,data=callApi("/analyse",{session=sessionId,revision=serverRevision,
+                    time=jobSettings.think,style=jobSettings.style,aggression=jobSettings.aggression},jobSettings)
+                if not running or not enabled or serial~=requestSerial or jobGeneration~=generation then inFlight=false; force=true; return end
+                if code~=200 or type(data)~="table" then fail(code,data); inFlight=false; return end
+                failures=0; lastSent=jobPlacement
+                clear()
+                if data.game_over then
+                    status("Fim: "..tostring(data.result).." | "..tostring(data.reason))
+                    inFlight=false; return
+                end
+                local move=data.move
+                if type(move)~="string" or not move:match("^[a-h][1-8][a-h][1-8][qrbn]?$") then
+                    fail(503,{text="Resposta sem movimento válido"}); inFlight=false; return
+                end
+                local from,to=move:sub(1,2),move:sub(3,4)
+                local piece=state[from]
+                if piece and piece.color==userColor then
+                    highlight(piece.instance,Color3.fromRGB(255,200,0))
+                    if tiles[to] then highlight(tiles[to],Color3.fromRGB(0,255,100))
+                    else
+                        local x,z=center(to)
+                        local marker=Instance.new("Part")
+                        marker.Name="Destino"; marker.Anchored=true; marker.CanCollide=false
+                        marker.CanTouch=false; marker.CanQuery=false
+                        marker.Size=Vector3.new(math.max(0.5,fileStep.Magnitude*0.9),0.08,math.max(0.5,rankStep.Magnitude*0.9))
+                        marker.Position=Vector3.new(x,a1.Y+0.15,z)
+                        marker.Material=Enum.Material.Neon; marker.Color=Color3.fromRGB(0,255,100)
+                        marker.Transparency=0.35; marker.Parent=visuals
+                    end
+                end
+                local evaluation=data.mate and ("mate "..tostring(data.mate)) or tostring(data.eval)
+                local text=move.." | avaliação brancas "..evaluation.." | profundidade "..tostring(data.depth)
+                status(text); log(text..string.format(" | total %.2fs",os.clock()-sentAt))
+                if data.style~=settings.style then log("Servidor aplicou estilo "..tostring(data.style)) end
+                if data.claimable_draw then log("Posição permite reivindicar empate") end
+                inFlight=false
+            end)
         end
-        if status~=200 or type(data)~="table" or data.error or data.type=="error" then
-            log("API rejeitou a consulta: "..tostring(body)); continue
-        end
-        local move=data.move or data.lan
-        if type(move)~="string" or not move:match("^[a-h][1-8][a-h][1-8][qrbn]?$") then
-            log("API não retornou movimento; posição encerrada ou resposta inválida"); continue
-        end
-        local from,to=move:sub(1,2),move:sub(3,4)
-        local p=state[from]
-        if not p or p.color~=userColor or turn~=userColor then continue end
-        if not at(pos(p.instance),from,0.12) then
-            log("Peça em movimento; atualize a dica quando parar"); continue
-        end
-        clear()
-        highlight(p.instance,Color3.fromRGB(255,200,0))
-        if tiles[to] then highlight(tiles[to],Color3.fromRGB(0,255,100))
-        else
-            local x,z=center(to)
-            local marker=Instance.new("Part")
-            marker.Name="Destino"; marker.Anchored=true; marker.CanCollide=false
-            marker.CanTouch=false; marker.CanQuery=false
-            marker.Size=Vector3.new(3.6,0.08,3.6); marker.Position=Vector3.new(x,1.1,z)
-            marker.Material=Enum.Material.Neon; marker.Color=Color3.fromRGB(0,255,100)
-            marker.Transparency=0.35; marker.Parent=visuals
-        end
-        log("Dica: "..from.." → "..to.." | profundidade "..tostring(data.depth)
-            .." | avaliação "..tostring(data.eval))
-        if #move==5 then log("Promoção sugerida: "..move:sub(5)) end
     end
 end)
 gui=Instance.new("ScreenGui")
 gui.Name="ChessHintControls"; gui.ResetOnSpawn=false
 gui.DisplayOrder=999999; gui.Parent=Player:WaitForChild("PlayerGui")
+local Input=game:GetService("UserInputService")
+local root=Instance.new("Frame")
+root.Size=UDim2.fromScale(1,1); root.BackgroundTransparency=1
+root.Parent=gui
 local frame=Instance.new("Frame")
-frame.Size=UDim2.fromOffset(350,230)
-frame.Position=UDim2.new(0.5,-175,0,85)
-frame.BackgroundColor3=Color3.fromRGB(28,31,39); frame.Parent=gui
+frame.Size=UDim2.fromOffset(350,450)
+frame.BackgroundColor3=Color3.fromRGB(28,31,39); frame.Parent=root
+frame.BorderSizePixel=0; frame.ClipsDescendants=true
 local corner=Instance.new("UICorner"); corner.Parent=frame
+local content=Instance.new("ScrollingFrame")
+content.Position=UDim2.fromOffset(0,64); content.Size=UDim2.new(1,0,1,-64)
+content.BackgroundTransparency=1; content.BorderSizePixel=0
+content.CanvasSize=UDim2.fromOffset(0,648); content.ScrollBarThickness=5
+content.ScrollingDirection=Enum.ScrollingDirection.Y; content.Parent=frame
 local function label(text,y)
     local l=Instance.new("TextLabel")
     l.Size=UDim2.new(1,0,0,28); l.Position=UDim2.fromOffset(0,y)
     l.BackgroundTransparency=1; l.Text=text; l.TextSize=16
-    l.TextColor3=Color3.new(1,1,1); l.Font=Enum.Font.GothamBold; l.Parent=frame
+    l.TextColor3=Color3.new(1,1,1); l.Font=Enum.Font.GothamBold; l.Parent=content
     return l
 end
 local title=label("Xadrez — escolha teu lado e a vez",5)
-label("Teu lado",35); label("Quem joga agora?",105)
+title.Parent=frame; title.Size=UDim2.new(1,-68,0,54)
+title.Position=UDim2.fromOffset(12,4); title.TextSize=15; title.TextWrapped=true
+local handle=Instance.new("TextButton")
+handle.Text=""; handle.BackgroundTransparency=1
+handle.Size=UDim2.new(1,-60,0,64); handle.Parent=frame
+label("Teu lado",0); label("Quem joga agora?",76)
 local function button(text,x,y,callback)
     local b=Instance.new("TextButton")
-    b.Size=UDim2.fromOffset(155,38); b.Position=UDim2.fromOffset(x,y)
+    b.Size=UDim2.new(0.5,-22,0,44)
+    b.Position=UDim2.new(x==15 and 0 or 0.5,x==15 and 15 or 7,0,y)
     b.Text=text; b.TextSize=15; b.Font=Enum.Font.GothamBold
     b.TextColor3=Color3.new(1,1,1); b.BackgroundColor3=Color3.fromRGB(65,76,130)
-    b.Parent=frame
+    b.Parent=content; b.TextWrapped=true
     local c=Instance.new("UICorner"); c.Parent=b
     b.Activated:Connect(callback)
     return b
 end
 local side,whose
 local wb,bb,wt,bt
-wb=button("Brancas",15,65,function()
+wb=button("Brancas",15,28,function()
     side="w"; wb.Text="✓ Brancas"; bb.Text="Pretas"
 end)
-bb=button("Pretas",180,65,function()
+bb=button("Pretas",180,28,function()
     side="b"; bb.Text="✓ Pretas"; wb.Text="Brancas"
 end)
-wt=button("Brancas jogam",15,135,function()
+wt=button("Brancas jogam",15,104,function()
     whose="w"; wt.Text="✓ Brancas jogam"; bt.Text="Pretas jogam"
 end)
-bt=button("Pretas jogam",180,135,function()
+bt=button("Pretas jogam",180,104,function()
     whose="b"; bt.Text="✓ Pretas jogam"; wt.Text="Brancas jogam"
 end)
-local start
-start=button("Iniciar",15,185,function()
-    if not side or not whose then title.Text="Escolha teu lado e quem joga agora"; return end
-    if initial and revision==0 then
-        whose="w"
-        log("Tabuleiro inicial: brancas jogam primeiro")
-    end
-    userColor,turn=side,whose
-    revision+=1; pending=nil; clear()
-    log("Teu lado: "..(side=="w" and "brancas" or "pretas").."; vez: "..(whose=="w" and "brancas" or "pretas"))
-    frame.Visible=false
-    queue()
+local function input(placeholder,y,text)
+    local box=Instance.new("TextBox")
+    box.Size=UDim2.new(1,-30,0,44); box.Position=UDim2.fromOffset(15,y)
+    box.BackgroundColor3=Color3.fromRGB(45,48,58)
+    box.TextColor3=Color3.new(1,1,1); box.TextSize=14
+    box.PlaceholderText=placeholder; box.Text=text or ""
+    box.ClearTextOnFocus=false; box.Font=Enum.Font.Gotham
+    box.Parent=content
+    return box
+end
+label("Servidor Stockfish v2",154)
+local urlBox=input("https://...trycloudflare.com",184,settings.url)
+local keyValue=settings.key or ""
+local keyBox=input("Chave exibida no servidor",238,"")
+keyBox.Size=UDim2.new(1,-108,0,44)
+local showingKey=false
+local function renderKey()
+    keyBox.Text=showingKey and keyValue or string.rep("*",math.min(#keyValue,24))
+end
+local keyToggle=button("Mostrar",180,238,function()
+    if keyBox:IsFocused() or showingKey then keyValue=keyBox.Text end
+    showingKey=not showingKey
+    renderKey()
 end)
-button("Parar",180,185,function() env.ChessHintStop() end)
+keyToggle.Size=UDim2.fromOffset(70,44); keyToggle.Position=UDim2.new(1,-85,0,238)
+keyBox.Focused:Connect(function() keyBox.Text=keyValue end)
+keyBox.FocusLost:Connect(function() keyValue=keyBox.Text; renderKey() end)
+renderKey()
+local timeBox=input("Segundos por análise (0.1 a 10)",292,tostring(settings.think))
+label("Personalidade",342)
+local preciseButton,attackButton
+local function refreshStyle()
+    preciseButton.Text=(settings.style=="precise" and "✓ " or "").."Preciso"
+    attackButton.Text=(settings.style=="attacking" and "✓ " or "").."Atacante"
+end
+preciseButton=button("Preciso",15,372,function()
+    settings.style="precise"; refreshStyle()
+end)
+attackButton=button("Atacante",180,372,function()
+    settings.style="attacking"; refreshStyle()
+end)
+refreshStyle()
+label("Agressividade: 0 a 100",422)
+local aggressionBox=input("0 = conservador; 100 = mais ousado",452,tostring(settings.aggression))
+label("FEN completa opcional (partida em andamento)",504)
+initialFenBox=input("Deixe vazio para detectar a posição atual",534,"")
+statusLabel=label("Configure e clique Iniciar",644)
+statusLabel.Parent=root
+statusLabel.Size=UDim2.new(1,-16,0,64); statusLabel.Position=UDim2.new(0,8,1,-124)
+statusLabel.BackgroundTransparency=0.15; statusLabel.BackgroundColor3=Color3.fromRGB(28,31,39)
+statusLabel.ZIndex=5
+statusLabel.TextWrapped=true; statusLabel.TextSize=13
+local start
+start=button("Iniciar / resincronizar",15,590,function()
+    if not side or not whose then title.Text="Escolha teu lado e quem joga agora"; return end
+    local url=urlBox.Text:match("^%s*(.-)%s*$"):gsub("/+$","")
+    local localPort=url:match("^http://127%.0%.0%.1:(%d+)$") or url:match("^http://localhost:(%d+)$")
+    if not url:match("^https://[%w%.%-]+$") and not (localPort and tonumber(localPort)>0 and tonumber(localPort)<=65535) then
+        title.Text="Use URL HTTPS ou http://127.0.0.1:8080; sem /analyse"; return
+    end
+    if keyBox:IsFocused() or showingKey then keyValue=keyBox.Text end
+    local key=keyValue:match("^%s*(.-)%s*$")
+    local seconds=tonumber(timeBox.Text)
+    if key=="" then title.Text="Cole a chave do Termux"; return end
+    if not seconds or seconds~=seconds or seconds<0.1 or seconds>10 then title.Text="Use de 0.1 a 10 segundos"; return end
+    local aggression=tonumber(aggressionBox.Text)
+    if not aggression or aggression~=aggression or aggression<0 or aggression>100 then
+        title.Text="Agressividade: use de 0 a 100"; return
+    end
+    local placement,observed=snapshot()
+    if not placement then title.Text="Espere as peças pararem antes de iniciar"; return end
+    generation=generation+1
+    if sessionId then discardSession() end
+    settings.url,settings.key,settings.think=url,key,seconds
+    settings.aggression=aggression
+    if writefile then
+        local saved=pcall(function() writefile(settingsFile,Http:JSONEncode({url=settings.url,think=settings.think,style=settings.style,aggression=settings.aggression})) end)
+        log(saved and "Configurações salvas em "..settingsFile or "Falha ao salvar arquivo; configurações mantidas nesta sessão")
+    else
+        log("Executor sem writefile: configurações salvas somente nesta sessão")
+    end
+    initialFen=initialFenBox.Text:match("^%s*(.-)%s*$")
+    userColor,turn=side,whose
+    state=observed
+    enabled=true; retryAt=0
+    env.ChessHintNow()
+    frame.Visible=false
+    status("Conectando e validando posição...")
+    log("Sessão iniciada; lado "..side.."; vez selecionada "..whose)
+
+end)
+button("Parar",180,590,function() env.ChessHintStop() end)
 local reopen=button("Configurar / dica",15,240,function()
     frame.Visible=true
     env.ChessHintNow()
 end)
 -- Mantém um botão acessível mesmo com o painel fechado.
-reopen.Parent=gui
-reopen.Position=UDim2.new(0,12,1,-52)
-reopen.Size=UDim2.fromOffset(165,38)
-log("ChessHint 1.3.0 ativo; "..#samples.." peças lidas")
+reopen.Parent=root
+reopen.Size=UDim2.fromOffset(165,44)
+reopen.ZIndex=6
+local minimize=button("—",15,0,function() frame.Visible=false end)
+minimize.Parent=frame; minimize.Size=UDim2.fromOffset(44,44)
+minimize.Position=UDim2.new(1,-52,0,10)
+local function watch(signal,fn)
+    table.insert(uiConnections,signal:Connect(fn))
+end
+local placed=false
+local function clampPosition(target,x,y)
+    local area=root.AbsoluteSize
+    local size=target.AbsoluteSize
+    target.Position=UDim2.fromOffset(
+        math.clamp(x,0,math.max(0,area.X-size.X)),
+        math.clamp(y,0,math.max(0,area.Y-size.Y)))
+end
+local function layout()
+    local area=root.AbsoluteSize
+    if area.X<=0 or area.Y<=0 then return end
+    frame.Size=UDim2.fromOffset(math.min(380,math.max(1,area.X-16)),math.min(470,math.max(1,area.Y-16)))
+    if not placed then
+        frame.Position=UDim2.fromOffset((area.X-frame.Size.X.Offset)/2,8)
+        placed=true
+    else
+        clampPosition(frame,frame.Position.X.Offset,frame.Position.Y.Offset)
+    end
+    reopen.Size=UDim2.fromOffset(math.min(165,area.X),math.min(44,area.Y))
+    reopen.Position=UDim2.fromOffset(8,math.max(0,area.Y-52))
+    clampPosition(reopen,8,math.max(0,area.Y-52))
+end
+-- Só o cabeçalho arrasta: campos e rolagem continuam recebendo toque.
+local dragging,origin,panelOrigin
+watch(handle.InputBegan,function(input)
+    if input.UserInputType==Enum.UserInputType.Touch
+        or input.UserInputType==Enum.UserInputType.MouseButton1 then
+        if dragging then return end
+        dragging=input; origin=input.Position; panelOrigin=frame.Position
+    end
+end)
+watch(Input.InputChanged,function(input)
+    if not dragging then return end
+    local touch=dragging.UserInputType==Enum.UserInputType.Touch
+    if (touch and input~=dragging)
+        or (not touch and input.UserInputType~=Enum.UserInputType.MouseMovement) then return end
+    local delta=input.Position-origin
+    clampPosition(frame,panelOrigin.X.Offset+delta.X,panelOrigin.Y.Offset+delta.Y)
+end)
+watch(Input.InputEnded,function(input)
+    if input==dragging then dragging=nil end
+end)
+watch(root:GetPropertyChangedSignal("AbsoluteSize"),layout)
+layout()
+log("ChessHint 2.0.0 ativo; "..#samples.." peças lidas")
+log("Arraste pelo título; role o painel para acessar todos os campos")
 log("Amarelo = peça; verde = destino. Escolha lado e vez no painel")
 log("Parar: getgenv().ChessHintStop(); dica: getgenv().ChessHintNow()")
+
+

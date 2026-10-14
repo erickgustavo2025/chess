@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Authenticated Stockfish UCI HTTP server."""
+"""Python / server.py / Python 3.10+ / authenticated Stockfish + legal sessions."""
 import argparse
 import hmac
 import json
 import math
 import secrets
 import threading
+import logging
+import signal
+from positions import PositionStore, PositionError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import chess
 import chess.engine
 
 ROOT = Path(__file__).resolve().parent
+VERSION = "2.0.0"
 
 def attack_value(board, move):
     side = board.turn
@@ -38,6 +42,10 @@ def attack_value(board, move):
     return value
 
 def select_line(board, lines, style, aggression):
+    lines = [line for line in lines if line.get("score") is not None and line.get("pv")
+             and line["pv"][0] in board.legal_moves]
+    if not lines:
+        raise RuntimeError("Motor não retornou linha válida")
     ranked = sorted(lines, key=lambda line: line["score"].pov(board.turn).score(mate_score=100000), reverse=True)
     best = ranked[0]
     best_score = best["score"].pov(board.turn)
@@ -61,16 +69,31 @@ class Service:
         self.lock = threading.Lock()
         self.force_precise = force_precise
         self.adaptive_time = adaptive_time
+        self.positions = PositionStore()
 
     def analyse(self, payload):
         if not isinstance(payload, dict):
             raise ValueError("JSON deve ser um objeto")
-        fen = payload.get("fen")
+        session_result = None
+        if "session" in payload:
+            with self.positions.lock:
+                session = self.positions._session(payload["session"])
+                revision = payload.get("revision")
+                if type(revision) is not int or revision != session.revision:
+                    raise PositionError("STALE", "Revisão da análise desatualizada")
+                board = session.board.copy(stack=True)
+                session_result = self.positions._result(payload["session"], session)
+            fen = board.fen(en_passant="fen")
+        else:
+            fen = payload.get("fen")
         if not isinstance(fen, str) or len(fen) > 256 or len(fen.split()) != 6:
             raise ValueError("Envie FEN completa com seis campos")
-        board = chess.Board(fen)
+        if session_result is None:
+            board = chess.Board(fen)
         if not board.is_valid():
             raise ValueError(f"Posição inválida; status={int(board.status())}")
+        if isinstance(payload.get("time"), bool) or isinstance(payload.get("aggression"), bool):
+            raise ValueError("Tempo e agressividade devem ser números")
         seconds = float(payload.get("time", 1))
         if not math.isfinite(seconds) or not 0.1 <= seconds <= 10:
             raise ValueError("Tempo deve estar entre 0.1 e 10 segundos")
@@ -93,7 +116,8 @@ class Service:
         outcome = board.outcome()
         if outcome:
             return {"game_over": True, "result": outcome.result(),
-                    "reason": outcome.termination.name}
+                    "reason": outcome.termination.name, "fen": fen,
+                    **(session_result or {})}
         if not self.lock.acquire(blocking=False):
             return None
         try:
@@ -115,12 +139,17 @@ class Service:
                     "aggression": aggression, "evaluation_loss_cp": loss,
                     "personality_supported": not self.force_precise, "multipv": count,
                     "requested_time": requested_seconds, "search_budget": seconds,
-                    "adaptive_time": self.adaptive_time}
+                    "adaptive_time": self.adaptive_time, "version": VERSION,
+                    "claimable_draw": board.can_claim_draw(), **(session_result or {})}
         finally:
             self.lock.release()
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(15)
 
     def reply(self, status, data):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -128,6 +157,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if status == 429:
+            self.send_header("Retry-After", "1")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
@@ -150,12 +181,14 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/health":
             self.reply(404, {"error": "NOT_FOUND"})
             return
-        self.reply(200, {"ok": True, "engine": self.server.service.engine.id})
+        self.reply(200, {"ok": True, "engine": self.server.service.engine.id,
+                         "version": VERSION, "sessions": True,
+                         "personality_supported": not self.server.service.force_precise})
 
     def do_POST(self):
         if not self.authorized():
             return
-        if self.path != "/analyse":
+        if self.path not in ("/analyse", "/session", "/sync", "/close"):
             self.reply(404, {"error": "NOT_FOUND"})
             return
         try:
@@ -165,9 +198,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.connection.settimeout(15)
             payload = json.loads(self.rfile.read(length))
-            result = self.server.service.analyse(payload)
-            self.reply(429, {"error": "BUSY"}) if result is None else self.reply(200, result)
-        except (ValueError, TypeError, UnicodeError) as exc:
+            if not isinstance(payload, dict):
+                raise ValueError("JSON deve ser objeto")
+            service = self.server.service
+            if self.path == "/session":
+                result = service.positions.create(payload.get("placement"), payload.get("turn"), payload.get("initial_fen"))
+            elif self.path == "/sync":
+                result = service.positions.sync(payload.get("session"), payload.get("placement"), payload.get("revision"))
+            elif self.path == "/close":
+                service.positions.delete(payload.get("session"))
+                result = {"ok": True}
+            else:
+                result = service.analyse(payload)
+            self.reply(429, {"error": "BUSY", "retry_after": 1}) if result is None else self.reply(200, result)
+        except PositionError as exc:
+            self.reply(409, {"error": exc.code, "text": str(exc)})
+        except (ValueError, TypeError, UnicodeError, OverflowError) as exc:
             self.reply(400, {"error": "INVALID_REQUEST", "text": str(exc)})
         except TimeoutError:
             self.reply(408, {"error": "TIMEOUT"})
@@ -176,7 +222,70 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(503, {"error": "ENGINE_ERROR", "text": "Reinicie o servidor"})
 
     def log_message(self, fmt, *args):
-        print(fmt % args, flush=True)
+        logging.info(fmt, *args)
+
+
+class BoundedServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, handler, capacity=16):
+        self.slots = threading.BoundedSemaphore(capacity)
+        super().__init__(address, handler)
+
+    def process_request(self, request, address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.slots.release()
+
+
+class EngineManager:
+    """Replace a terminated UCI process once, under Service's analysis lock."""
+    def __init__(self, path, threads, hash_mb):
+        self.path = path
+        self.options = {"Threads": threads, "Hash": hash_mb,
+                        "Skill Level": 20, "UCI_LimitStrength": False}
+        self.engine = None
+        self._start()
+
+    @property
+    def id(self):
+        return self.engine.id
+
+    def _start(self):
+        if self.engine is not None:
+            self.engine.close()
+        self.engine = chess.engine.SimpleEngine.popen_uci(self.path, timeout=20)
+        try:
+            self.engine.configure(self.options)
+        except BaseException:
+            self.engine.close()
+            raise
+
+    def analyse(self, *args, **kwargs):
+        for attempt in range(2):
+            try:
+                return self.engine.analyse(*args, **kwargs)
+            except (chess.engine.EngineTerminatedError, chess.engine.EngineError,
+                    TimeoutError, BrokenPipeError):
+                if attempt:
+                    raise
+                logging.warning("Reiniciando Stockfish após falha UCI")
+                self._start()
+
+    def close(self):
+        self.engine.close()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -196,21 +305,28 @@ def main():
     key = key_path.read_text().strip()
     if not key:
         raise SystemExit("Arquivo .api-key vazio")
-    with chess.engine.SimpleEngine.popen_uci(args.engine, timeout=20) as engine:
-        engine.configure({"Threads": args.threads, "Hash": args.hash,
-                          "Skill Level": 20, "UCI_LimitStrength": False})
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    engine = EngineManager(args.engine, args.threads, args.hash)
+    server = None
+    def shutdown_signal(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, shutdown_signal)
+    signal.signal(signal.SIGINT, shutdown_signal)
+    try:
+        server = BoundedServer(("127.0.0.1", args.port), Handler)
         server.service = Service(engine, key, args.force_precise, args.adaptive_time)
         print("Motor:", engine.id.get("name"), flush=True)
+        print("ChessHint", VERSION, flush=True)
         print("Chave para colar no painel:", key, flush=True)
         print(f"Servidor: http://127.0.0.1:{args.port}", flush=True)
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        finally:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if server:
             server.server_close()
+        engine.close()
 
 if __name__ == "__main__":
     main()
+
 
